@@ -1,16 +1,17 @@
 // ==UserScript==
 // @name         OJ 代码对比 (Luogu/AtCoder/Codeforces)
 // @namespace    oj-code-diff
-// @version      2.0.0
+// @version      2.1.0
 // @description  OJ 代码对比工具，支持洛谷、AtCoder、Codeforces 的提交记录对比，支持手动输入、字体/行距/缩进调节、亮暗模式
 // @author       useluogu
 // @homepageURL  https://github.com/useluogu/Code-Comparison-Plugin
 // @updateURL    https://raw.githubusercontent.com/useluogu/Code-Comparison-Plugin/main/oj-code-diff.user.js
 // @downloadURL  https://raw.githubusercontent.com/useluogu/Code-Comparison-Plugin/main/oj-code-diff.user.js
 // @match        https://www.luogu.com.cn/*
-// @match        https://atcoder.jp/contests/*/submissions/*
+// @match        https://atcoder.jp/contests/*
 // @match        https://codeforces.com/*/submission/*
-// @match        https://codeforces.com/contest/*/
+// @match        https://codeforces.com/contest/*
+// @match        https://codeforces.com/problemset/*
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @connect      atcoder.jp
@@ -88,10 +89,6 @@
     return true;
   }
 
-  function clearModalStack() {
-    modalStack.length = 0;
-  }
-
   // ======================== 用户设置 ========================
   const SETTINGS_KEY = 'oj-diff-settings';
   const DEFAULT_SETTINGS = {
@@ -100,6 +97,7 @@
     tabSize: 4,
     themeMode: 'auto',
     collapseUnchanged: true,
+    viewMode: 'unified', // 'unified' | 'split'
   };
 
   function loadSettings() {
@@ -166,6 +164,7 @@
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
   }
+
 
   /**
    * GM_xmlhttpRequest 封装（用于跨域请求）
@@ -252,6 +251,20 @@
       if (response.code !== undefined && response.code !== 200)
         throw new Error(`洛谷返回错误码: ${response.code}`);
       const data = response.currentData || response.data || response.record || response;
+      // 验证返回的记录 ID 是否与请求一致（防止 Luogu 缓存/重定向导致返回错误记录）
+      if (data.record && String(data.record.id) !== String(recordId)) {
+        console.warn(`[Luogu] 返回记录 ID(${data.record.id}) 与请求 ID(${recordId}) 不一致，重新获取`);
+        // 强制再请求一次
+        const text2 = await gmFetch(jsonUrl + '&_t=' + Date.now(), {
+          headers: { Accept: 'application/json' }
+        });
+        const response2 = JSON.parse(text2);
+        const data2 = response2.currentData || response2.data || response2.record || response2;
+        if (data2.record && String(data2.record.id) === String(recordId)) {
+          return data2.record;
+        }
+        throw new Error(`洛谷 API 返回了提交 #${data.record?.id}（而非 #${recordId}），可能因缓存导致`);
+      }
       if (!data.record) throw new Error('无法获取记录信息（response 中缺少 record 字段）');
       return data.record;
     },
@@ -262,6 +275,7 @@
       if (params.pid)  query.set('pid',  params.pid);
       if (params.user) query.set('user', params.user);
       if (params.page) query.set('page', String(params.page));
+      query.set('_contentOnly', '1');
       const url = `${base}/record/list?${query.toString()}`;
       const text = await gmFetch(url, {
         headers: { Accept: 'application/json' }
@@ -278,19 +292,25 @@
       return [];
     },
 
-    async findPrevRecord(currentRecordId, pid, uid) {
-      for (let page = 1; page <= 2; page++) {
+    async findPrevRecord(currentRecordId, currentRecord) {
+      // 从当前记录对象提取题目 ID 和用户 ID
+      const pid = this.getProblemId(currentRecord);
+      const uid = this.getUserId(currentRecord);
+      if (!pid || !uid) throw new Error('无法获取当前提交的题目/用户信息');
+      for (let page = 1; page <= 5; page++) {
         const records = await this.fetchRecordList({ pid, user: String(uid), page });
+        if (!records || records.length === 0) break;
+
+        // 在当前页找当前记录
         const idx = records.findIndex(r => String(r.id) === String(currentRecordId));
         if (idx !== -1) {
+          // 当前页找到——取后一个（更旧的）
           if (idx + 1 < records.length) return records[idx + 1];
+          // 当前记录是此页最后一个，继续下一页
           continue;
         }
-        for (const r of records) {
-          if (String(r.id) !== String(currentRecordId)) return r;
-        }
       }
-      throw new Error('未找到该题目的上一次提交记录');
+      throw new Error('未找到该题目的上一次提交记录（当前记录可能是最新的一次，或已超出翻页范围）');
     },
 
     /** 获取当前页面已有的 record 数据（避免重复请求） */
@@ -320,159 +340,48 @@
     },
   };
 
-  // ---------- AtCoder Adapter ----------
+  // ---------- AtCoder Adapter（精简版：仅支持手动输入代码对比） ----------
   const AtCoderAdapter = {
     platform: PLATFORMS.ATCODER,
 
-    /** 从 URL 提取 submission ID */
     getRecordIdFromUrl() {
-      const match = window.location.pathname.match(/\/submissions\/(\d+)/);
-      return match ? match[1] : null;
+      const m = window.location.pathname.match(/\/submissions\/(\d+)/);
+      return m ? m[1] : null;
     },
 
     isRecordPage() {
       return /\/submissions\/\d+/.test(window.location.pathname);
     },
 
-    /**
-     * 获取 submission 详情——解析 HTML 页面中的 #program-source-text
-     * 返回 { sourceCode: string, contestId?: string, problemId?: string, userId?: string }
-     */
+    /** 仅读取当前页 DOM 中的代码；非当前页抛错 */
     async fetchRecordDetail(submissionId) {
-      const url = `https://atcoder.jp/contests/${this.getContestSlug()}/submissions/${submissionId}`;
-      const html = await gmFetch(url);
-      const doc = parseHtml(html);
-
-      // 提取代码
-      const sourceEl = doc.getElementById('program-source-text');
-      if (!sourceEl) throw new Error(`AtCoder 提交 #${submissionId} 的代码不可见（可能需要登录或权限不足）`);
-
-      const sourceCode = sourceEl.textContent || '';
-
-      // 提取元信息（从提交详情页表格）
-      let contestId = '';
-      let problemId = '';
-      let userId = '';
-
-      // 尝试从 table 中提取信息
-      const rows = doc.querySelectorAll('#main-container table tbody tr');
-      for (const row of rows) {
-        const cells = row.querySelectorAll('td');
-        if (cells.length >= 2) {
-          const label = cells[0].textContent.trim();
-          const value = cells[1].textContent.trim();
-          if (label.includes('Problem'))       problemId = value.split(' ')[0];
-          else if (label.includes('User'))     userId = value;
-          else if (label.includes('Contest'))   contestId = value;
-        }
+      const curId = this.getRecordIdFromUrl();
+      if (curId && String(curId) === String(submissionId)) {
+        const el = document.getElementById('program-source-text');
+        if (el) return { sourceCode: el.textContent || '', id: submissionId };
       }
-
-      // Problem ID fallback: 从标题或链接提取
-      if (!problemId) {
-        const probLink = doc.querySelector('a[href*="/tasks/"]');
-        if (probLink) {
-          const m = probLink.href.match(/\/tasks\/(.+)/);
-          if (m) problemId = m[1];
-        }
-      }
-
-      return { sourceCode, contestId, problemId, userId, id: submissionId };
+      throw new Error('AtCoder 仅支持对当前页提交操作，请使用"✏️两份代码对比"手动输入');
     },
 
-    /** 获取当前 URL 中的 contest slug */
-    getContestSlug() {
-      const match = window.location.pathname.match(/^\/contests\/([^/]+)/);
-      if (match) return match[1];
-
-      // 如果在 submissions 页面但不在 contests 下，尝试其他路径格式
-      const altMatch = window.location.pathname.match(/\/contests\/([^/]+)/);
-      return altMatch ? altMatch[1] : 'abc001'; // fallback
-    },
-
-    /**
-     * 获取用户的最近提交列表（通过解析 my submissions 页面）
-     * 返回 [{id, epochSecond, problemId, result}...]
-     */
-    async fetchRecentSubmissions(userName, limit) {
-      limit = limit || 50;
-      const slug = this.getContestSlug();
-      const url = `https://atcoder.jp/contests/${slug}/submissions?f.User=${encodeURIComponent(userName)}&orderBy=source_created&page=1&pageSize=${limit}`;
-      const html = await gmFetch(url);
-      const doc = parseHtml(html);
-
-      const results = [];
-      const rows = doc.querySelectorAll('#main-container tbody tr');
-      for (const row of rows) {
-        const cells = row.querySelectorAll('td');
-        if (cells.length < 8) continue;
-
-        const submitLink = cells[0].querySelector('a');
-        const id = submitLink ? submitLink.textContent.trim() : '';
-
-        const problemLink = cells[1].querySelector('a');
-        const problemId = problemLink ? (problemLink.href.match(/\/tasks\/(.+)/)?.[1] || '') : '';
-
-        const userCell = cells[2].querySelector('a');
-        const userNameCell = userCell ? userCell.textContent.trim() : '';
-
-        const result = cells[6]?.textContent?.trim() || '';
-        const timeStr = cells[7]?.textContent?.trim() || ''; // 提交时间
-
-        if (id) {
-          results.push({ id, problemId, userName: userNameCell, result, timeStr });
-        }
-      }
-      return results;
-    },
-
-    /**
-     * 找到上一次提交（在同一题目下、当前用户、比当前提交更早）
-     */
-    async findPrevRecord(submissionId, currentRecord) {
-      const userName = currentRecord.userId;
-      if (!userName) throw new Error('无法获取当前用户名');
-
-      const subs = await this.fetchRecentSubmissions(userName, 50);
-
-      // 过滤同一题目的提交
-      const sameProblem = subs.filter(s =>
-        s.problemId === currentRecord.problemId && s.id !== String(submissionId)
-      );
-
-      if (sameProblem.length > 0) {
-        // 返回第一个更早的提交（列表已按时间倒序排列）
-        return sameProblem.map(s => ({ id: s.id }))[0];
-      }
-
-      // fallback: 尝试找任意更早的提交
-      const others = subs.filter(s => s.id !== String(submissionId));
-      if (others.length > 0) return { id: others[0].id };
-
-      throw new Error('未找到该题目的上一次提交记录');
+    findPrevRecord() {
+      throw new Error('AtCoder 暂不支持此功能，请使用"✏️两份代码对比"手动输入');
     },
 
     getPageData() {
-      // AtCoder 不像 luogu 有注入数据
-      return null;
+      const el = document.getElementById('program-source-text');
+      return el ? { sourceCode: el.textContent || '', id: this.getRecordIdFromUrl() } : null;
     },
 
     recordUrl(submissionId) {
-      const slug = this.getContestSlug();
-      return `https://atcoder.jp/contests/${slug}/submissions/${submissionId}`;
+      const slug = (window.location.pathname.match(/\/contests\/([^/]+)/) || [])[1] || '';
+      return slug ? `https://atcoder.jp/contests/${slug}/submissions/${submissionId}` : '#';
     },
 
-    getSourceCode(record) {
-      return record.sourceCode ?? '';
-    },
-
-    getProblemId(record) {
-      return record.problemId || null;
-    },
-
-    getUserId(record) {
-      return record.userId || null;
-    },
+    getSourceCode(record)       { return record.sourceCode ?? ''; },
+    getProblemId(record)        { return record.problemId || null; },
+    getUserId(record)           { return record.userId || null; },
   };
+
 
   // ---------- Codeforces Adapter ----------
   const CfAdapter = {
@@ -490,118 +399,162 @@
     },
 
     /**
-     * 通过 CF API + 页面解析获取提交详情
-     * API: https://codeforces.com/api/user.status?handle=xxx
-     * 页面: #program-source-text
+     * 获取提交详情。
      *
-     * 返回 { sourceCode: string, contestId: number, problemIndex: string, handle: string, id: number }
+     * 流程：
+     *   1. 优先用 hint.contestId（findPrevRecord 已知）构建 URL；
+     *      否则用 CF API 查该 submissionId 的 contestId，再构建 URL。
+     *      这样保证每次都请求正确的页面，不依赖当前浏览器 URL。
+     *   2. 拿到 HTML 后从 DOM 提取 sourceCode、handle、problemIndex。
+     *
+     * 返回 { sourceCode, contestId, problemIndex, handle, id }
      */
-    async fetchRecordDetail(submissionId) {
-      // 先通过 API 获取元信息（包含 contestId, problemIndex 等）
-      let apiData = null;
+    async fetchRecordDetail(submissionId, hint) {
+      // --- 第一步：确定正确的 contestId，再构建 URL ---
+      let contestId = hint?.contestId || '';
+      let handle = '';
+      let problemIndex = '';
 
-      // 尝试从当前页面的全局变量获取 handle
-      const cfHandle = _unsafeWindow.CF?.currentUserHandle ||
-                       document.querySelector('.rank a, .user-box a, .info a')?.textContent?.trim() ||
-                       '';
-
-      if (cfHandle) {
-        try {
-          const apiUrl = `https://codeforces.com/api/user.status?handle=${encodeURIComponent(cfHandle)}&from=1&count=100`;
-          const apiText = await gmFetch(apiUrl);
-          apiData = JSON.parse(apiText);
-        } catch (e) {
-          console.warn('[CF] API 获取失败，仅使用页面解析:', e);
+      if (!contestId) {
+        // 用当前登录用户 handle 调 API，找到该 submissionId 的 contestId
+        const cfHandle = _unsafeWindow.CF?.currentUserHandle ||
+                         document.querySelector('a.rated-user, a[href*="/profile/"]')?.textContent?.trim() ||
+                         '';
+        if (cfHandle) {
+          try {
+            const apiUrl = `https://codeforces.com/api/user.status?handle=${encodeURIComponent(cfHandle)}&from=1&count=500`;
+            const apiText = await gmFetch(apiUrl);
+            const apiData = JSON.parse(apiText);
+            if (apiData.status === 'OK') {
+              const sub = apiData.result.find(s => s.id === Number(submissionId));
+              if (sub) {
+                contestId    = String(sub.contestId || '');
+                problemIndex = sub.problem.index || '';
+                handle       = sub.author.members[0]?.handle || cfHandle;
+              }
+            }
+          } catch (e) {
+            console.warn('[CF] API 查 contestId 失败，将用无 contest 路径:', e);
+          }
+        }
+        // 如果 API 没命中，只有当 submissionId 就是当前页的提交时才用当前页 URL 里的 contestId
+        if (!contestId) {
+          const curPageSubId = window.location.pathname.match(/\/submission\/(\d+)/)?.[1];
+          if (curPageSubId && curPageSubId === String(submissionId)) {
+            contestId = window.location.pathname.match(/\/contest\/(\d+)/)?.[1] || '';
+          }
+          // 否则不 fallback，用无 contest 路径（/submission/id）
         }
       }
 
-      // 解析提交详情页面获取代码
-      const pageUrl = this.buildSubmissionUrl(submissionId);
+      // --- 第二步：用准确的 contestId 拉页面 ---
+      const pageUrl = this.buildSubmissionUrl(submissionId, contestId);
       const html = await gmFetch(pageUrl);
       const doc = parseHtml(html);
 
+      // 提取源代码
       const sourceEl = doc.getElementById('program-source-text');
-      if (!sourceEl) throw new Error(`CF 提交 #${submissionId} 的代码不可见（可能需要登录或权限不足）`);
+      if (!sourceEl) throw new Error(`CF 提交 #${submissionId} 的代码不可见（可能需要登录或不是自己的提交）`);
       const sourceCode = sourceEl.textContent || '';
+      if (!sourceCode.trim()) throw new Error(`CF 提交 #${submissionId} 的代码为空（可能被折叠或需要登录查看）`);
 
-      // 从 API 数据补充元信息
-      let contestId = '', problemIndex = '', handle = '';
-
-      if (apiData && apiData.status === 'OK') {
-        const sub = apiData.result.find(s => s.id === Number(submissionId));
-        if (sub) {
-          contestId = String(sub.contestId || '');
-          problemIndex = sub.problem.index || '';
-          handle = sub.author.members[0]?.handle || '';
-        }
-      }
-
-      // fallback: 从页面 DOM 提取
-      if (!problemIndex) {
-        // CF 提交页通常显示 "Problem XXXXA" 或类似
-        const probEl = doc.querySelector('.problem-statement-header a, .problemPar a, [class*="problem"] a');
-        if (probEl) {
-          const m = probEl.textContent.match(/[A-Z]\d?[A-Z]?$/i);
-          if (m) problemIndex = m[0].toUpperCase();
-        }
-      }
+      // --- 第三步：从页面 DOM 补全仍缺的 handle / problemIndex ---
       if (!handle) {
-        const handleEl = doc.querySelector('.rated-user, .user-red, .user-blue, .user-black, .user-cyan, .user-orange, .user-legendary, a[href*="/profile/"]');
-        if (handleEl) {
-          handle = handleEl.textContent.trim();
+        const ratedLinks = doc.querySelectorAll('a[href*="/profile/"]');
+        for (const link of ratedLinks) {
+          const t = link.textContent.trim();
+          if (t && !t.includes(' ')) { handle = t; break; }
+        }
+      }
+      if (!problemIndex) {
+        const titleEl = doc.querySelector('title');
+        if (titleEl) {
+          const m = titleEl.textContent.match(/Problem\s+([A-Z]\d*)/i);
+          if (m) problemIndex = m[1].toUpperCase();
+        }
+      }
+      if (!problemIndex) {
+        const subInfoRows = doc.querySelectorAll('.info-table tr, table.table tr');
+        for (const row of subInfoRows) {
+          const cells = row.querySelectorAll('td');
+          if (cells.length >= 2 && cells[0].textContent.trim().toLowerCase().includes('problem')) {
+            const link = cells[1].querySelector('a');
+            if (link) {
+              const m = (link.textContent || link.href).match(/\/([A-Z]\d*)(?:[/?#]|$)/i);
+              if (m) { problemIndex = m[1].toUpperCase(); break; }
+            }
+          }
         }
       }
 
       return { sourceCode, contestId, problemIndex, handle, id: submissionId };
     },
 
-    /** 构建 submission 详情页 URL */
-    buildSubmissionUrl(submissionId) {
-      // 尝试从当前 URL 推断 contestId
-      const contestMatch = window.location.pathname.match(/\/contest\/(\d+)/);
-      if (contestMatch) {
-        return `https://codeforces.com/contest/${contestMatch[1]}/submission/${submissionId}`;
+    /**
+     * 构建 submission 详情页 URL。
+     * 必须传入 contestId 才能访问正确页面；无 contestId 时用无 contest 路径（可能 404）。
+     */
+    buildSubmissionUrl(submissionId, contestId) {
+      if (contestId) {
+        return `https://codeforces.com/contest/${contestId}/submission/${submissionId}`;
       }
       return `https://codeforces.com/submission/${submissionId}`;
     },
 
     /**
-     * 通过 CF API 查找上一次提交
+     * 通过 CF API 查找同一人、同一题的上一次提交。
      */
     async findPrevRecord(submissionId, currentRecord) {
       const handle = currentRecord.handle;
-      if (!handle) throw new Error('无法获取当前用户 handle（请先登录 CF）');
+      if (!handle) throw new Error('无法获取提交者 handle（请确认已登录 CF 且本提交为自己的）');
 
-      const apiUrl = `https://codeforces.com/api/user.status?handle=${encodeURIComponent(handle)}&from=1&count=200`;
-      const apiText = await gmFetch(apiUrl);
-      const apiData = JSON.parse(apiText);
-
-      if (apiData.status !== 'OK') throw new Error(`CF API 错误: ${apiData.comment}`);
-
-      const subs = apiData.result;
-      // 按 id 倒序排列（CF 默认就是倒序的）
-      const currentIdx = subs.findIndex(s => s.id === Number(submissionId));
-
-      // 找下一个（更早的提交），且最好同一题
-      if (currentIdx >= 0) {
-        // 同题目的上一个
-        for (let i = currentIdx + 1; i < subs.length; i++) {
-          if (subs[i].problem.contestId === Number(currentRecord.contestId) &&
-              subs[i].problem.index === currentRecord.problemIndex) {
-            return { id: String(subs[i].id) };
-          }
-        }
-        // 任意上一个
-        if (currentIdx + 1 < subs.length) {
-          return { id: String(subs[currentIdx + 1].id) };
-        }
+      // 检查提交者是否为当前登录用户（避免拿别人的提交来找"上一次提交"）
+      const loggedInHandle = _unsafeWindow.CF?.currentUserHandle ||
+                             document.querySelector('a.rated-user, a[href*="/profile/"]')?.textContent?.trim() || '';
+      if (loggedInHandle && loggedInHandle !== handle) {
+        throw new Error(`此提交属于 ${handle}，不是你本人的提交，无法查找上一次提交`);
       }
 
-      // fallback: 在结果中直接搜索
-      const found = subs.find(s => s.id !== Number(submissionId));
-      if (found) return { id: String(found.id) };
+      const curContestId  = Number(currentRecord.contestId);
+      const curProblemIdx = currentRecord.problemIndex;
+      if (!curContestId || !curProblemIdx) {
+        throw new Error('无法识别当前提交的题目信息，无法查找上一次提交');
+      }
 
-      throw new Error('未找到上一次提交记录');
+      // 分页搜索：最多 2 页（每页 1000 条），覆盖约 2000 条提交记录
+      const PAGE_SIZE = 1000;
+      const MAX_PAGES = 2;
+
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const from = page * PAGE_SIZE + 1;
+        const apiUrl = `https://codeforces.com/api/user.status?handle=${encodeURIComponent(handle)}&from=${from}&count=${PAGE_SIZE}`;
+        const apiText = await gmFetch(apiUrl);
+        const apiData = JSON.parse(apiText);
+        if (apiData.status !== 'OK') throw new Error(`CF API 错误: ${apiData.comment}`);
+
+        const subs = apiData.result; // 按提交时间倒序
+
+        // 只在第 1 页查找当前提交的位置
+        const currentIdx = page === 0
+          ? subs.findIndex(s => s.id === Number(submissionId))
+          : -1;
+
+        // 从当前提交往后（更早的提交）找同一题
+        const start = currentIdx >= 0 ? currentIdx + 1 : 0;
+        for (let i = start; i < subs.length; i++) {
+          const s = subs[i];
+          if (s.problem.contestId === curContestId && s.problem.index === curProblemIdx) {
+            return { id: String(s.id), contestId: String(s.contestId || curContestId) };
+          }
+        }
+
+        // 当前提交不在本页末尾 → 已全量搜索，无需下一页
+        if (currentIdx >= 0 && currentIdx + 1 < subs.length) break;
+        // 当前提交未找到且本页未满 → 后面不会有更旧的了
+        if (currentIdx < 0 && subs.length < PAGE_SIZE) break;
+      }
+
+      throw new Error(`未找到 ${handle} 对题目 ${curContestId}${curProblemIdx} 的上一次提交`);
     },
 
     getPageData() {
@@ -609,8 +562,10 @@
       return null;
     },
 
-    recordUrl(submissionId) {
-      return this.buildSubmissionUrl(submissionId);
+    recordUrl(submissionId, record) {
+      // 如果有 record 对象，用其中的 contestId 构建精确 URL
+      const cid = record?.contestId;
+      return this.buildSubmissionUrl(submissionId, cid);
     },
 
     getSourceCode(record) {
@@ -618,11 +573,10 @@
     },
 
     getProblemId(record) {
-      // CF 用 contestId+problemIndex 标识
       if (record.contestId && record.problemIndex) {
         return `${record.contestId}${record.problemIndex}`;
       }
-      return record.problemId || null;
+      return null;
     },
 
     getUserId(record) {
@@ -832,6 +786,103 @@
     return html;
   }
 
+  // ======================== 并列视图 HTML 构建 ========================
+
+  /**
+   * 将 rawDiffs 转为并列（side-by-side）视图的 HTML。
+   * 左侧显示旧代码（removed + unchanged），右侧显示新代码（added + unchanged）。
+   * removed/added 行对齐：连续的 removed/added 块按行数对齐，短的一侧用空占位行补齐。
+   */
+  function buildSplitHtml(diffs) {
+    // 先将 diffs 展开为对齐的行对 [{left, right}]
+    // left/right: null（空占位）或 {type, content, lineNum}
+    const pairs = [];
+    let oldNum = 0, newNum = 0;
+    let i = 0;
+    while (i < diffs.length) {
+      const d = diffs[i];
+      if (d.type === 'collapsed') {
+        pairs.push({ type: 'collapsed', data: d });
+        if (d.oldEnd != null) { oldNum = d.oldEnd; newNum = d.newEnd; }
+        else { oldNum += d.count; newNum += d.count; }
+        i++;
+      } else if (d.type === 'unchanged') {
+        oldNum++; newNum++;
+        pairs.push({ type: 'row', left: { type: 'unchanged', content: d.content, lineNum: oldNum }, right: { type: 'unchanged', content: d.content, lineNum: newNum } });
+        i++;
+      } else if (d.type === 'removed' || d.type === 'added') {
+        // 收集连续的 removed / added 块，成对对齐
+        const removedGroup = [], addedGroup = [];
+        while (i < diffs.length && (diffs[i].type === 'removed' || diffs[i].type === 'added')) {
+          if (diffs[i].type === 'removed') removedGroup.push(diffs[i]);
+          else addedGroup.push(diffs[i]);
+          i++;
+        }
+        const maxLen = Math.max(removedGroup.length, addedGroup.length);
+        let lo = oldNum, ln = newNum;
+        for (let j = 0; j < maxLen; j++) {
+          const r = j < removedGroup.length ? removedGroup[j] : null;
+          const a = j < addedGroup.length  ? addedGroup[j]   : null;
+          if (r) lo++;
+          if (a) ln++;
+          pairs.push({
+            type: 'row',
+            left:  r ? { type: 'removed', content: r.content, lineNum: lo } : null,
+            right: a ? { type: 'added',   content: a.content, lineNum: ln } : null,
+          });
+        }
+        oldNum = lo; newNum = ln;
+      } else {
+        i++;
+      }
+    }
+
+    // 渲染 pairs 为 HTML，使用 CSS Grid 两列布局
+    let html = '<div class="oj-diff-split-container">';
+    for (const p of pairs) {
+      if (p.type === 'collapsed') {
+        const d = p.data;
+        const hasLineInfo = d.oldStart != null;
+        const oldRange = hasLineInfo ? (d.oldStart === d.oldEnd ? String(d.oldStart) : d.oldStart + '-' + d.oldEnd) : '';
+        const newRange = hasLineInfo ? (d.newStart === d.newEnd ? String(d.newStart) : d.newStart + '-' + d.newEnd) : '';
+        const label = '⋯ ' + d.count + ' 行相同代码' + (hasLineInfo && d.oldStart !== d.oldEnd ? '（' + d.oldStart + '–' + d.oldEnd + ' 行）' : '') + ' ⋯';
+        // 折叠行：横跨两列
+        html += '<div class="oj-diff-split-collapsed oj-diff-collapsed" data-count="' + d.count + '">' +
+          '<div class="oj-diff-split-half oj-diff-split-left">' +
+            '<span class="oj-diff-ln-old oj-diff-ln-collapsed">' + oldRange + '</span>' +
+            '<span class="oj-diff-split-collapsed-inner oj-diff-collapsed-btn" title="点击展开">' + label + '</span>' +
+          '</div>' +
+          '<div class="oj-diff-split-half oj-diff-split-right">' +
+            '<span class="oj-diff-ln-new oj-diff-ln-collapsed">' + newRange + '</span>' +
+            '<span class="oj-diff-split-collapsed-inner"></span>' +
+          '</div>' +
+        '</div>';
+      } else {
+        const L = p.left, R = p.right;
+        const lType = L ? L.type : 'empty';
+        const rType = R ? R.type : 'empty';
+        html += '<div class="oj-diff-split-row">' +
+          // 左列
+          '<div class="oj-diff-split-half oj-diff-split-left oj-diff-split-' + lType + '">' +
+            '<span class="oj-diff-ln-old">' + (L ? L.lineNum : '') + '</span>' +
+            (lType === 'removed' ? '<span class="oj-diff-marker">-</span>' : '<span class="oj-diff-marker oj-diff-marker-empty"></span>') +
+            '<span class="oj-diff-content">' + (L ? escapeHtml(L.content) : '') + '</span>' +
+          '</div>' +
+          // 分隔线
+          '<div class="oj-diff-split-divider"></div>' +
+          // 右列
+          '<div class="oj-diff-split-half oj-diff-split-right oj-diff-split-' + rType + '">' +
+            '<span class="oj-diff-ln-new">' + (R ? R.lineNum : '') + '</span>' +
+            (rType === 'added' ? '<span class="oj-diff-marker">+</span>' : '<span class="oj-diff-marker oj-diff-marker-empty"></span>') +
+            '<span class="oj-diff-content">' + (R ? escapeHtml(R.content) : '') + '</span>' +
+          '</div>' +
+        '</div>';
+      }
+    }
+    html += '</div>';
+    return html;
+  }
+
   // ======================== 加载遮罩 ========================
 
   function createLoadingOverlay(message) {
@@ -892,7 +943,14 @@
       ? collapseUnchanged(rawDiffs)
       : rawDiffs;
 
-    let codeHtml = buildCodeHtml(displayDiffs, true);
+    let currentViewMode = settings.viewMode || 'unified';
+
+    function renderCodeHtml(diffs, viewMode) {
+      if (viewMode === 'split') return buildSplitHtml(diffs);
+      return buildCodeHtml(diffs, true);
+    }
+
+    let codeHtml = renderCodeHtml(displayDiffs, currentViewMode);
 
     let expandedDiffs = rawDiffs;
 
@@ -999,6 +1057,13 @@
       '<button class="oj-diff-collapse-toggle" id="oj-diff-collapse-btn" title="折叠/展开未变更行">' +
         '<span class="oj-diff-collapse-icon">📄</span>' +
         '<span class="oj-diff-collapse-label">未折叠</span>' +
+      '</button>' +
+
+      '<span class="oj-diff-settings-divider">|</span>' +
+
+      '<button class="oj-diff-view-toggle" id="oj-diff-view-btn" title="切换统一/并列视图">' +
+        '<span class="oj-diff-view-icon"></span>' +
+        '<span class="oj-diff-view-label"></span>' +
       '</button>';
 
     // ---- Footer ----
@@ -1008,7 +1073,13 @@
     const footerLeft = document.createElement('div');
     footerLeft.className = 'oj-diff-footer-left';
 
-    if (hasRecordId) {
+    const isAtCoder = CURRENT_PLATFORM?.id === 'atcoder';
+
+    if (isAtCoder) {
+      // AtCoder 只保留手动输入对比
+      footerLeft.innerHTML =
+        '<button class="oj-diff-btn oj-diff-btn-secondary" id="oj-diff-manual-compare">✏️ 两份代码对比</button>';
+    } else if (hasRecordId) {
       footerLeft.innerHTML =
         '<button class="oj-diff-btn oj-diff-btn-secondary" id="oj-diff-prev-compare"' + (isPrevCompare ? ' disabled title="当前已在与上次提交对比"' : ' title="与上一次提交记录对比"') + '>⇄ 与上次提交对比</button>' +
         '<button class="oj-diff-btn oj-diff-btn-secondary" id="oj-diff-manual-compare">✏️ 两份代码对比</button>' +
@@ -1021,7 +1092,10 @@
     }
 
     const footerRight = document.createElement('div');
+    footerRight.style.cssText = 'display:flex;gap:8px;align-items:center;';
     footerRight.innerHTML =
+      '<button class="oj-diff-btn oj-diff-btn-secondary" id="oj-diff-copy-old">📋 复制旧版</button>' +
+      '<button class="oj-diff-btn oj-diff-btn-secondary" id="oj-diff-copy-new">📋 复制新版</button>' +
       '<button class="oj-diff-btn oj-diff-btn-primary" id="oj-diff-close-btn">关闭</button>';
 
     footer.appendChild(footerLeft);
@@ -1116,7 +1190,7 @@
       }
       saveSettings(currentSettings);
       currentDiffs = newDiffs;
-      codeArea.innerHTML = buildCodeHtml(newDiffs, true);
+      codeArea.innerHTML = renderCodeHtml(newDiffs, currentViewMode);
       applyCodeSettings(codeArea, currentSettings);
       bindCollapseButtons(codeArea, newDiffs, expandedDiffs, currentSettings);
       refreshCollapseIcon();
@@ -1158,7 +1232,7 @@
           if (!hasMoreCollapsed) { s.collapseUnchanged = false; saveSettings(s); }
           currentDiffs = newCollapsedDiffs;
 
-          area.innerHTML = buildCodeHtml(newCollapsedDiffs, true);
+          area.innerHTML = renderCodeHtml(newCollapsedDiffs, currentViewMode);
           applyCodeSettings(area, s);
           bindCollapseButtons(area, newCollapsedDiffs, allDiffs, s);
           refreshCollapseIcon();
@@ -1199,7 +1273,7 @@
           });
 
           currentDiffs = newDiffs;
-          area.innerHTML = buildCodeHtml(newDiffs, true);
+          area.innerHTML = renderCodeHtml(newDiffs, currentViewMode);
           applyCodeSettings(area, s);
           bindCollapseButtons(area, newDiffs, allDiffs, s);
           refreshCollapseIcon();
@@ -1207,6 +1281,41 @@
       });
     }
     bindCollapseButtons(codeArea, displayDiffs, expandedDiffs, currentSettings);
+
+    // 视图切换（unified / split）
+    const viewBtn = overlay.querySelector('#oj-diff-view-btn');
+    const viewIcon = viewBtn.querySelector('.oj-diff-view-icon');
+    const viewLabel = viewBtn.querySelector('.oj-diff-view-label');
+
+    function updateViewBtn(mode) {
+      if (mode === 'split') {
+        viewIcon.textContent = '⇔';
+        viewLabel.textContent = '并列视图';
+        viewBtn.title = '当前：并列视图，点击切换为统一视图';
+        viewBtn.classList.add('active');
+      } else {
+        viewIcon.textContent = '☰';
+        viewLabel.textContent = '统一视图';
+        viewBtn.title = '当前：统一视图，点击切换为并列视图';
+        viewBtn.classList.remove('active');
+      }
+    }
+    updateViewBtn(currentViewMode);
+
+    viewBtn.addEventListener('click', () => {
+      currentViewMode = currentViewMode === 'split' ? 'unified' : 'split';
+      currentSettings.viewMode = currentViewMode;
+      saveSettings(currentSettings);
+      updateViewBtn(currentViewMode);
+      // split 视图不支持折叠图标，但支持折叠块（collapsed）
+      codeArea.innerHTML = renderCodeHtml(currentDiffs, currentViewMode);
+      applyCodeSettings(codeArea, currentSettings);
+      bindCollapseButtons(codeArea, currentDiffs, expandedDiffs, currentSettings);
+      // split 时加宽 modal
+      modal.style.maxWidth = currentViewMode === 'split' ? '1400px' : '';
+    });
+    // 初始如果是 split 也要加宽
+    if (currentViewMode === 'split') modal.style.maxWidth = '1400px';
 
     // 亮暗模式切换
     const THEME_CYCLE = ['auto', 'light', 'dark'];
@@ -1223,12 +1332,26 @@
     });
 
     // 关闭逻辑
-    const closeFinal = () => { clearModalStack(); overlay.remove(); };
     const closeBack = () => { overlay.remove(); popAndRestore(); };
     const hasParent = modalStack.length > 0;
 
     closeBtn.addEventListener('click', closeBack);
     overlay.querySelector('#oj-diff-close-btn').addEventListener('click', closeBack);
+    // 复制代码
+    overlay.querySelector('#oj-diff-copy-old').addEventListener('click', () => {
+      navigator.clipboard.writeText(String(oldCode || '')).then(() => {
+        showToast('旧版代码已复制到剪贴板', 'success');
+      }).catch(() => {
+        showToast('复制失败（请检查剪贴板权限）', 'error');
+      });
+    });
+    overlay.querySelector('#oj-diff-copy-new').addEventListener('click', () => {
+      navigator.clipboard.writeText(String(newCode || '')).then(() => {
+        showToast('新版代码已复制到剪贴板', 'success');
+      }).catch(() => {
+        showToast('复制失败（请检查剪贴板权限）', 'error');
+      });
+    });
     overlay.addEventListener('click', (e) => { if (e.target === overlay) closeBack(); });
     const escHandler = (e) => {
       if (e.key === 'Escape') { closeBack(); document.removeEventListener('keydown', escHandler); }
@@ -1242,7 +1365,7 @@
     }
 
     // 按钮事件绑定
-    if (hasRecordId) {
+    if (!isAtCoder && hasRecordId) {
       if (!isPrevCompare) {
         overlay.querySelector('#oj-diff-prev-compare').addEventListener('click', () => {
           pushAndHide(overlay);
@@ -1261,10 +1384,12 @@
       showManualInputDialog();
     });
 
-    overlay.querySelector('#oj-diff-record-compare').addEventListener('click', () => {
-      pushAndHide(overlay);
-      showRecordCompareDialog();
-    });
+    if (!isAtCoder) {
+      overlay.querySelector('#oj-diff-record-compare').addEventListener('click', () => {
+        pushAndHide(overlay);
+        showRecordCompareDialog();
+      });
+    }
   }
 
   // ======================== 手动输入对比对话框 ========================
@@ -1574,16 +1699,14 @@
 
       const oldCode = ADAPTER.getSourceCode(oldRecord);
       const newCode = ADAPTER.getSourceCode(newRecord);
-      if (!oldCode && oldCode !== '')
-        throw new Error('旧版本 #' + oldId + ' 的代码不可访问');
-      if (!newCode && newCode !== '')
-        throw new Error('新版本 #' + newId + ' 的代码不可访问');
+      if (!oldCode) throw new Error('旧版本 #' + oldId + ' 的代码不可访问或为空');
+      if (!newCode) throw new Error('新版本 #' + newId + ' 的代码不可访问或为空');
 
       removeLoadingOverlay();
       showDiffModal(
         String(oldCode), String(newCode),
         String(oldId), String(newId),
-        ADAPTER.recordUrl(oldId), ADAPTER.recordUrl(newId),
+        ADAPTER.recordUrl(oldId, oldRecord), ADAPTER.recordUrl(newId, newRecord),
         ADAPTER.getRecordIdFromUrl(),
         false
       );
@@ -1600,49 +1723,40 @@
       let currentRecord;
       let targetRecord;
 
-      // 尝试从页面缓存获取
-      const pageData = ADAPTER.getPageData();
-      if (pageData) currentRecord = pageData;
-
       if (targetRecordId) {
-        if (!currentRecord) {
-          updateLoadingMessage(loading, '正在获取当前提交代码...');
-          currentRecord = await ADAPTER.fetchRecordDetail(currentRecordId);
-        }
+        // 指定提交 ID 对比——总是从 API 重新获取，避免 getPageData 可能缺少 sourceCode
+        updateLoadingMessage(loading, '正在获取当前提交代码...');
+        currentRecord = await ADAPTER.fetchRecordDetail(currentRecordId);
         updateLoadingMessage(loading, '正在获取对比提交代码...');
         targetRecord = await ADAPTER.fetchRecordDetail(targetRecordId);
       } else {
         // 与上次提交对比
-        if (!currentRecord) {
+        // 尝试从页面缓存获取（仅洛谷有效，快速获取当前记录信息）
+        const pageData = ADAPTER.getPageData();
+        if (pageData) {
+          currentRecord = pageData;
+        } else {
           updateLoadingMessage(loading, '正在获取当前提交信息...');
           currentRecord = await ADAPTER.fetchRecordDetail(currentRecordId);
-        }
-        const pid = ADAPTER.getProblemId(currentRecord);
-        const uid = ADAPTER.getUserId(currentRecord);
-        if (!pid) {
-          // 对于不依赖 problem ID 的平台（如 CF 用 API 直接查），uid 可选
-          console.warn('[OJ代码对比] 无法获取题目/问题 ID，尝试通用查找');
         }
         updateLoadingMessage(loading, '正在查找上一次提交记录...');
         const prevBase = await ADAPTER.findPrevRecord(currentRecordId, currentRecord);
         updateLoadingMessage(loading, '正在获取上一次提交代码...');
-        targetRecord = await ADAPTER.fetchRecordDetail(prevBase.id);
+        targetRecord = await ADAPTER.fetchRecordDetail(prevBase.id, prevBase);
       }
 
       const curCode = ADAPTER.getSourceCode(currentRecord);
       const tgtCode = ADAPTER.getSourceCode(targetRecord);
-      if (!curCode && curCode !== '')
-        throw new Error('当前提交的代码不可访问（可能是隐私设置或权限不足）');
-      if (!tgtCode && tgtCode !== '')
-        throw new Error('对比提交的代码不可访问（可能是隐私设置或权限不足）');
+      if (!curCode) throw new Error('当前提交的代码不可访问或为空（可能是隐私设置或权限不足）');
+      if (!tgtCode) throw new Error('对比提交的代码不可访问或为空（可能是隐私设置或权限不足）');
 
       removeLoadingOverlay();
       showDiffModal(
         String(tgtCode), String(curCode),
         String(targetRecord.id || targetRecordId),
         String(currentRecord.id || currentRecordId),
-        ADAPTER.recordUrl(targetRecord.id || targetRecordId),
-        ADAPTER.recordUrl(currentRecord.id || currentRecordId),
+        ADAPTER.recordUrl(targetRecord.id || targetRecordId, targetRecord),
+        ADAPTER.recordUrl(currentRecord.id || currentRecordId, currentRecord),
         String(currentRecordId),
         !targetRecordId
       );
@@ -1688,6 +1802,7 @@
     if (existing) { existing.remove(); return; }
     const dark = isDarkMode();
     const C = getColors(dark);
+    const isAtCoder = CURRENT_PLATFORM?.id === 'atcoder';
     const menu = document.createElement('div');
     menu.id = 'oj-diff-float-menu';
     menu.style.cssText =
@@ -1696,12 +1811,16 @@
       'background:' + C.modalBg + ';border:1px solid ' + C.border + ';' +
       'border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.2);' +
       'padding:8px 0;min-width:220px;';
-    const items = [
-      { text: '⇄ 与上次提交记录对比', action: () => runCompare(recordId, null) },
-      { text: '🔢 与指定提交记录对比', action: () => promptCustomCompare(recordId) },
-      { text: '✏️ 两份代码对比', action: () => showManualInputDialog() },
-      { text: '📋 两次提交记录对比', action: () => showRecordCompareDialog() },
-    ];
+    const items = isAtCoder
+      ? [
+          { text: '✏️ 两份代码对比', action: () => showManualInputDialog() },
+        ]
+      : [
+          { text: '⇄ 与上次提交记录对比', action: () => runCompare(recordId, null) },
+          { text: '🔢 与指定提交记录对比', action: () => promptCustomCompare(recordId) },
+          { text: '✏️ 两份代码对比', action: () => showManualInputDialog() },
+          { text: '📋 两次提交记录对比', action: () => showRecordCompareDialog() },
+        ];
     for (const item of items) {
       const el = document.createElement('div');
       el.textContent = item.text;
@@ -1744,19 +1863,24 @@
       return b;
     }
 
-    const b1 = makeBtn('⇄ 与上次提交对比', '#667eea', async () => {
-      b1.style.pointerEvents = 'none';
-      try { await runCompare(recordId, null); }
-      finally { b1.style.pointerEvents = 'auto'; }
-    });
-    const b2 = makeBtn('🔢 与指定提交对比', '#8b5cf6', () => promptCustomCompare(recordId));
-    const b3 = makeBtn('✏️ 两份代码对比', '#059669', () => showManualInputDialog());
-    const b4 = makeBtn('📋 两次提交记录对比', '#d97706', () => showRecordCompareDialog());
+    const isAtCoder = CURRENT_PLATFORM?.id === 'atcoder';
 
-    container.appendChild(b1);
-    container.appendChild(b2);
-    container.appendChild(b3);
-    container.appendChild(b4);
+    let buttons;
+    if (isAtCoder) {
+      buttons = [makeBtn('✏️ 两份代码对比', '#059669', () => showManualInputDialog())];
+    } else {
+      const b1 = makeBtn('⇄ 与上次提交对比', '#667eea', async () => {
+        b1.style.pointerEvents = 'none';
+        try { await runCompare(recordId, null); }
+        finally { b1.style.pointerEvents = 'auto'; }
+      });
+      const b2 = makeBtn('🔢 与指定提交对比', '#8b5cf6', () => promptCustomCompare(recordId));
+      const b3 = makeBtn('✏️ 两份代码对比', '#059669', () => showManualInputDialog());
+      const b4 = makeBtn('📋 两次提交记录对比', '#d97706', () => showRecordCompareDialog());
+      buttons = [b1, b2, b3, b4];
+    }
+
+    for (const b of buttons) container.appendChild(b);
 
     const preParent = codeBlock.closest('pre') || codeBlock.parentElement;
     if (preParent && preParent.parentElement) {
@@ -1809,10 +1933,13 @@
       'background:' + C.modalBg + ';border:1px solid ' + C.border + ';' +
       'border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.2);' +
       'padding:8px 0;min-width:200px;';
-    const items = [
-      { text: '✏️ 两份代码对比', action: () => showManualInputDialog() },
-      { text: '📋 两次提交记录对比', action: () => showRecordCompareDialog() },
-    ];
+    const isAtCoder = CURRENT_PLATFORM?.id === 'atcoder';
+    const items = isAtCoder
+      ? [{ text: '✏️ 两份代码对比', action: () => showManualInputDialog() }]
+      : [
+          { text: '✏️ 两份代码对比', action: () => showManualInputDialog() },
+          { text: '📋 两次提交记录对比', action: () => showRecordCompareDialog() },
+        ];
     for (const item of items) {
       const el = document.createElement('div');
       el.textContent = item.text;
@@ -1989,7 +2116,8 @@
       /* Settings bar */
       .oj-diff-settings-bar {
         display: flex; align-items: center; gap: 10px;
-        padding: 8px 20px; border-top: 1px solid; flex-shrink: 0; flex-wrap: wrap;
+        padding: 8px 20px; border-top: 1px solid; flex-shrink: 0;
+        overflow-x: auto; white-space: nowrap;
       }
       .oj-diff-light .oj-diff-settings-bar { border-color: #e1e4e8; background: #ffffff; }
       .oj-diff-dark  .oj-diff-settings-bar { border-color: #30363d; background: #161b22; }
@@ -2001,7 +2129,7 @@
       /* Slider */
       .oj-diff-slider {
         -webkit-appearance: none; appearance: none; height: 4px; border-radius: 4px;
-        outline: none; cursor: pointer; width: 90px; flex-shrink: 0;
+        outline: none; cursor: pointer; width: 80px; min-width: 80px; max-width: 80px; flex-shrink: 0;
       }
       .oj-diff-light .oj-diff-slider { background: #d1d5da; }
       .oj-diff-dark  .oj-diff-slider { background: #30363d; }
@@ -2042,12 +2170,16 @@
       .oj-diff-collapse-label { font-size: 11px; line-height: 1; }
       .oj-diff-light .oj-diff-collapse-toggle { color: #586069; border-color: #d1d5da; }
       .oj-diff-light .oj-diff-collapse-toggle:hover { background: #f3f4f6; border-color: #667eea; color: #667eea; }
-      .oj-diff-light .oj-diff-collapse-toggle.active { border-color: #667eea; color: #667eea; background: #eaf1fb; }
-      .oj-diff-light .oj-diff-collapse-toggle.partial { border-color: #e8a317; color: #b08800; background: #fff8e1; }
+      .oj-diff-light .oj-diff-collapse-toggle.active,
+      .oj-diff-light .oj-diff-collapse-toggle.active:hover { border-color: #667eea; color: #667eea; background: #eaf1fb; }
+      .oj-diff-light .oj-diff-collapse-toggle.partial,
+      .oj-diff-light .oj-diff-collapse-toggle.partial:hover { border-color: #e8a317; color: #b08800; background: #fff8e1; }
       .oj-diff-dark  .oj-diff-collapse-toggle { color: #8b949e; border-color: #30363d; }
       .oj-diff-dark  .oj-diff-collapse-toggle:hover { background: #21262d; border-color: #667eea; color: #667eea; }
-      .oj-diff-dark  .oj-diff-collapse-toggle.active { border-color: #667eea; color: #667eea; background: #1a2332; }
-      .oj-diff-dark  .oj-diff-collapse-toggle.partial { border-color: #d29922; color: #d29922; background: #261e0a; }
+      .oj-diff-dark  .oj-diff-collapse-toggle.active,
+      .oj-diff-dark  .oj-diff-collapse-toggle.active:hover { border-color: #667eea; color: #667eea; background: #1a2332; }
+      .oj-diff-dark  .oj-diff-collapse-toggle.partial,
+      .oj-diff-dark  .oj-diff-collapse-toggle.partial:hover { border-color: #d29922; color: #d29922; background: #261e0a; }
 
       /* Fold icon */
       .oj-diff-fold-icon {
@@ -2087,6 +2219,92 @@
       .oj-diff-dark  .oj-diff-btn-secondary { border-color: #30363d; color: #8b949e; }
       .oj-diff-dark  .oj-diff-btn-secondary:hover { background: #21262d; }
       .oj-diff-btn-secondary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+      /* View toggle button */
+      .oj-diff-view-toggle {
+        height: 32px; border: 1.5px solid; border-radius: 6px;
+        cursor: pointer; font-size: 12px; display: flex; align-items: center;
+        gap: 4px; flex-shrink: 0; transition: all 0.2s;
+        padding: 0 8px; background: transparent; white-space: nowrap;
+      }
+      .oj-diff-view-icon { font-size: 14px; line-height: 1; }
+      .oj-diff-view-label { font-size: 11px; line-height: 1; }
+      .oj-diff-light .oj-diff-view-toggle { color: #586069; border-color: #d1d5da; }
+      .oj-diff-light .oj-diff-view-toggle:hover { background: #f3f4f6; border-color: #667eea; color: #667eea; }
+      .oj-diff-light .oj-diff-view-toggle.active,
+      .oj-diff-light .oj-diff-view-toggle.active:hover { border-color: #667eea; color: #667eea; background: #eaf1fb; }
+      .oj-diff-dark  .oj-diff-view-toggle { color: #8b949e; border-color: #30363d; }
+      .oj-diff-dark  .oj-diff-view-toggle:hover { background: #21262d; border-color: #667eea; color: #667eea; }
+      .oj-diff-dark  .oj-diff-view-toggle.active,
+      .oj-diff-dark  .oj-diff-view-toggle.active:hover { border-color: #667eea; color: #667eea; background: #1a2332; }
+
+      /* Split view */
+      .oj-diff-split-container { display: flex; flex-direction: column; width: 100%; }
+
+      .oj-diff-split-row {
+        display: flex; align-items: stretch; min-height: 1.5em;
+      }
+      .oj-diff-split-collapsed {
+        display: flex; align-items: stretch; cursor: pointer; user-select: none;
+      }
+
+      .oj-diff-split-half {
+        display: flex; align-items: baseline; flex: 1; min-width: 0; overflow: hidden;
+      }
+      .oj-diff-split-half .oj-diff-content { flex: 1; white-space: pre; padding-left: 4px; min-width: 0; overflow: hidden; }
+      .oj-diff-split-half .oj-diff-ln-old,
+      .oj-diff-split-half .oj-diff-ln-new { flex-shrink: 0; }
+
+      .oj-diff-split-divider { width: 2px; flex-shrink: 0; }
+      .oj-diff-light .oj-diff-split-divider { background: #e1e4e8; }
+      .oj-diff-dark  .oj-diff-split-divider { background: #30363d; }
+
+      /* Split: unchanged */
+      .oj-diff-light .oj-diff-split-unchanged { background: #ffffff; }
+      .oj-diff-dark  .oj-diff-split-unchanged { background: #0d1117; }
+      .oj-diff-light .oj-diff-split-unchanged .oj-diff-ln-old,
+      .oj-diff-light .oj-diff-split-unchanged .oj-diff-ln-new { color: #959da5; background: #f6f8fa; }
+      .oj-diff-light .oj-diff-split-unchanged .oj-diff-content { color: #24292e; }
+      .oj-diff-dark  .oj-diff-split-unchanged .oj-diff-ln-old,
+      .oj-diff-dark  .oj-diff-split-unchanged .oj-diff-ln-new { color: #484f58; background: #161b22; }
+      .oj-diff-dark  .oj-diff-split-unchanged .oj-diff-content { color: #e6edf3; }
+
+      /* Split: removed (left) */
+      .oj-diff-light .oj-diff-split-removed { background: #ffeef0; }
+      .oj-diff-light .oj-diff-split-removed .oj-diff-ln-old { color: #cb2431; background: #f8d7da; }
+      .oj-diff-light .oj-diff-split-removed .oj-diff-marker  { color: #cb2431; }
+      .oj-diff-light .oj-diff-split-removed .oj-diff-content { color: #24292e; }
+      .oj-diff-dark  .oj-diff-split-removed { background: #3d1a1a; }
+      .oj-diff-dark  .oj-diff-split-removed .oj-diff-ln-old  { color: #f85149; background: #4d2020; }
+      .oj-diff-dark  .oj-diff-split-removed .oj-diff-marker  { color: #f85149; }
+      .oj-diff-dark  .oj-diff-split-removed .oj-diff-content { color: #e6edf3; }
+
+      /* Split: added (right) */
+      .oj-diff-light .oj-diff-split-added { background: #e6ffed; }
+      .oj-diff-light .oj-diff-split-added .oj-diff-ln-new { color: #22863a; background: #cdffd8; }
+      .oj-diff-light .oj-diff-split-added .oj-diff-marker  { color: #22863a; }
+      .oj-diff-light .oj-diff-split-added .oj-diff-content { color: #24292e; }
+      .oj-diff-dark  .oj-diff-split-added { background: #1b3a1f; }
+      .oj-diff-dark  .oj-diff-split-added .oj-diff-ln-new  { color: #3fb950; background: #245028; }
+      .oj-diff-dark  .oj-diff-split-added .oj-diff-marker  { color: #3fb950; }
+      .oj-diff-dark  .oj-diff-split-added .oj-diff-content { color: #e6edf3; }
+
+      /* Split: empty side (placeholder) */
+      .oj-diff-light .oj-diff-split-empty { background: #f6f8fa; }
+      .oj-diff-dark  .oj-diff-split-empty { background: #161b22; }
+      .oj-diff-split-empty .oj-diff-content { opacity: 0; pointer-events: none; }
+
+      /* Split: collapsed */
+      .oj-diff-split-collapsed .oj-diff-split-half { align-items: center; }
+      .oj-diff-split-collapsed-inner { display: block; width: 100%; padding: 4px 8px; font-size: 11px; font-family: sans-serif; }
+      .oj-diff-light .oj-diff-split-collapsed .oj-diff-split-half { background: #f6f8fa; border-top: 1px dashed #d1d5da; border-bottom: 1px dashed #d1d5da; }
+      .oj-diff-light .oj-diff-split-collapsed .oj-diff-split-collapsed-inner { color: #586069; }
+      .oj-diff-light .oj-diff-split-collapsed:hover .oj-diff-split-half { background: #eaf1fb; }
+      .oj-diff-light .oj-diff-split-collapsed:hover .oj-diff-split-collapsed-inner { color: #0366d6; }
+      .oj-diff-dark  .oj-diff-split-collapsed .oj-diff-split-half { background: #0d1117; border-top: 1px dashed #30363d; border-bottom: 1px dashed #30363d; }
+      .oj-diff-dark  .oj-diff-split-collapsed .oj-diff-split-collapsed-inner { color: #8b949e; }
+      .oj-diff-dark  .oj-diff-split-collapsed:hover .oj-diff-split-half { background: #161b22; }
+      .oj-diff-dark  .oj-diff-split-collapsed:hover .oj-diff-split-collapsed-inner { color: #58a6ff; }
     `);
   }
 
@@ -2095,13 +2313,13 @@
   function init() {
     injectStyles();
 
-    if (!CURRENT_PLATFORM) return; // 非支持的域名，不做任何事
+    if (!CURRENT_PLATFORM) return;
 
     const recordId = ADAPTER.getRecordIdFromUrl();
     const onRecordPage = ADAPTER.isRecordPage();
 
     if (onRecordPage && recordId) {
-      // 记录详情页——完整功能
+      // 记录详情页——完整功能（各平台已根据自身能力裁剪按钮）
       let debounceTimer = null;
       function scheduleInject() {
         if (debounceTimer) clearTimeout(debounceTimer);
