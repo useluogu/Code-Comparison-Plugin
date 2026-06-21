@@ -1,3 +1,3 @@
 # Code-Comparison-Plugin
 
-(link)[https://www.luogu.me/article/170jpurl]
+[link](https://www.luogu.me/article/170jpurl)
