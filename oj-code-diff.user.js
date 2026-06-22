@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OJ 代码对比 (Luogu/AtCoder/Codeforces)
 // @namespace    oj-code-diff
-// @version      2.1.0
-// @description  OJ 代码对比工具，支持洛谷、AtCoder、Codeforces 的提交记录对比，支持手动输入、字体/行距/缩进调节、亮暗模式
+// @version      2.2.0
+// @description  洛谷/Codeforces 提交记录代码对比，AtCoder 手动输入对比。支持并列视图、折叠未变更行、复制代码
 // @author       useluogu
 // @homepageURL  https://github.com/useluogu/Code-Comparison-Plugin
 // @updateURL    https://raw.githubusercontent.com/useluogu/Code-Comparison-Plugin/main/oj-code-diff.user.js
@@ -163,6 +163,51 @@
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
+  }
+
+  /** 让浮动按钮可拖动（mousedown → mousemove 拖动，>5px 视为拖动不触发点击） */
+  function makeDraggable(btn) {
+    let dragging = false, dragStartX, dragStartY, startLeft, startTop;
+    let useTop = false;
+
+    btn.addEventListener('mousedown', (e) => {
+      dragging = false;
+      const rect = btn.getBoundingClientRect();
+      dragStartX = e.clientX; dragStartY = e.clientY;
+      startLeft = rect.left; startTop = rect.top;
+
+      if (!useTop) {
+        btn.style.bottom = '';
+        btn.style.right = '';
+        btn.style.width = btn.offsetWidth + 'px'; // 固定宽度，防止切换定位后拉伸
+        btn.style.top = rect.top + 'px';
+        btn.style.left = rect.left + 'px';
+        useTop = true;
+      }
+      btn.style.cursor = 'grabbing';
+      btn.style.transition = 'none';
+      const bw = btn.offsetWidth, bh = btn.offsetHeight;
+
+      const onMove = (ev) => {
+        const dx = ev.clientX - dragStartX, dy = ev.clientY - dragStartY;
+        if (Math.abs(dx) > 5 || Math.abs(dy) > 5) dragging = true;
+        btn.style.left = Math.max(0, Math.min(startLeft + dx, window.innerWidth - bw)) + 'px';
+        btn.style.top  = Math.max(0, Math.min(startTop  + dy, window.innerHeight - bh)) + 'px';
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        btn.style.cursor = 'pointer';
+        btn.style.transition = 'all 0.2s ease';
+        // 拖动后阻止 click 事件弹出菜单
+        if (dragging) {
+          const noClick = (ce) => { ce.stopImmediatePropagation(); btn.removeEventListener('click', noClick, true); };
+          btn.addEventListener('click', noClick, true);
+        }
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
   }
 
 
@@ -1793,34 +1838,36 @@
       btn.style.boxShadow = '0 4px 16px rgba(102,126,234,0.4)';
     });
     btn.addEventListener('click', () => showFloatingMenu(recordId));
-
     document.body.appendChild(btn);
+    makeDraggable(btn);
   }
 
   function showFloatingMenu(recordId) {
     const existing = document.getElementById('oj-diff-float-menu');
     if (existing) { existing.remove(); return; }
+    const btn = document.getElementById('oj-diff-compare-btn');
+    if (!btn) return;
+    const rect = btn.getBoundingClientRect();
     const dark = isDarkMode();
     const C = getColors(dark);
     const isAtCoder = CURRENT_PLATFORM?.id === 'atcoder';
-    const menu = document.createElement('div');
-    menu.id = 'oj-diff-float-menu';
-    menu.style.cssText =
-      'position:fixed;z-index:100001;' +
-      'bottom:72px;right:24px;' +
-      'background:' + C.modalBg + ';border:1px solid ' + C.border + ';' +
-      'border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.2);' +
-      'padding:8px 0;min-width:220px;';
     const items = isAtCoder
-      ? [
-          { text: '✏️ 两份代码对比', action: () => showManualInputDialog() },
-        ]
+      ? [ { text: '✏️ 两份代码对比', action: () => showManualInputDialog() } ]
       : [
           { text: '⇄ 与上次提交记录对比', action: () => runCompare(recordId, null) },
           { text: '🔢 与指定提交记录对比', action: () => promptCustomCompare(recordId) },
           { text: '✏️ 两份代码对比', action: () => showManualInputDialog() },
           { text: '📋 两次提交记录对比', action: () => showRecordCompareDialog() },
         ];
+    const menuW = 220;
+    const menu = document.createElement('div');
+    menu.id = 'oj-diff-float-menu';
+    menu.style.cssText =
+      'position:fixed;z-index:-1;top:0;left:0;visibility:hidden;' +
+      'background:' + C.modalBg + ';border:1px solid ' + C.border + ';' +
+      'border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.2);' +
+      'padding:8px 0;min-width:' + menuW + 'px;';
+    // 先装填项目、挂到 DOM 测量实际高度，再移除并重新定位
     for (const item of items) {
       const el = document.createElement('div');
       el.textContent = item.text;
@@ -1832,6 +1879,26 @@
       el.addEventListener('click', () => { menu.remove(); item.action(); });
       menu.appendChild(el);
     }
+    document.body.appendChild(menu);
+    const actualH = menu.offsetHeight;
+    menu.remove();
+    menu.style.visibility = '';
+    menu.style.zIndex = '100001';
+    // 水平位置：优先右对齐，太靠左则左对齐
+    let ml = rect.right - menuW;
+    if (ml < 4) ml = Math.max(4, rect.left);
+    if (ml + menuW > window.innerWidth - 4) ml = window.innerWidth - menuW - 4;
+    // 垂直位置：上方空间够则在按钮上方，否则在下方
+    let mt;
+    if (rect.top > actualH + 12) {
+      mt = rect.top - 8 - actualH;
+    } else {
+      mt = rect.bottom + 8;
+    }
+    mt = Math.max(4, Math.min(mt, window.innerHeight - actualH - 4));
+    menu.style.top = mt + 'px';
+    menu.style.left = ml + 'px';
+    document.body.appendChild(menu);
     document.body.appendChild(menu);
     const outsideClick = (e) => {
       if (!menu.contains(e.target)) { menu.remove(); document.removeEventListener('click', outsideClick); }
@@ -1916,23 +1983,16 @@
       btn.style.boxShadow = '0 4px 16px rgba(102,126,234,0.4)';
     });
     btn.addEventListener('click', () => showUniversalMenu(btn));
-
     document.body.appendChild(btn);
+    makeDraggable(btn);
   }
 
   function showUniversalMenu(anchor) {
     const existing = document.getElementById('oj-diff-universal-menu');
     if (existing) { existing.remove(); return; }
+    const rect = anchor.getBoundingClientRect();
     const dark = isDarkMode();
     const C = getColors(dark);
-    const menu = document.createElement('div');
-    menu.id = 'oj-diff-universal-menu';
-    menu.style.cssText =
-      'position:fixed;z-index:100001;' +
-      'bottom:72px;right:24px;' +
-      'background:' + C.modalBg + ';border:1px solid ' + C.border + ';' +
-      'border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.2);' +
-      'padding:8px 0;min-width:200px;';
     const isAtCoder = CURRENT_PLATFORM?.id === 'atcoder';
     const items = isAtCoder
       ? [{ text: '✏️ 两份代码对比', action: () => showManualInputDialog() }]
@@ -1940,6 +2000,14 @@
           { text: '✏️ 两份代码对比', action: () => showManualInputDialog() },
           { text: '📋 两次提交记录对比', action: () => showRecordCompareDialog() },
         ];
+    const menuW = 200;
+    const menu = document.createElement('div');
+    menu.id = 'oj-diff-universal-menu';
+    menu.style.cssText =
+      'position:fixed;z-index:-1;top:0;left:0;visibility:hidden;' +
+      'background:' + C.modalBg + ';border:1px solid ' + C.border + ';' +
+      'border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.2);' +
+      'padding:8px 0;min-width:' + menuW + 'px;';
     for (const item of items) {
       const el = document.createElement('div');
       el.textContent = item.text;
@@ -1951,6 +2019,23 @@
       el.addEventListener('click', () => { menu.remove(); item.action(); });
       menu.appendChild(el);
     }
+    document.body.appendChild(menu);
+    const actualH = menu.offsetHeight;
+    menu.remove();
+    menu.style.visibility = '';
+    menu.style.zIndex = '100001';
+    let ml = rect.right - menuW;
+    if (ml < 4) ml = Math.max(4, rect.left);
+    if (ml + menuW > window.innerWidth - 4) ml = window.innerWidth - menuW - 4;
+    let mt;
+    if (rect.top > actualH + 12) {
+      mt = rect.top - 8 - actualH;
+    } else {
+      mt = rect.bottom + 8;
+    }
+    mt = Math.max(4, Math.min(mt, window.innerHeight - actualH - 4));
+    menu.style.top = mt + 'px';
+    menu.style.left = ml + 'px';
     document.body.appendChild(menu);
     const outsideClick = (e) => {
       if (!menu.contains(e.target)) { menu.remove(); document.removeEventListener('click', outsideClick); }
