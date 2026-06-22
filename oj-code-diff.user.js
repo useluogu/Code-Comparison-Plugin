@@ -176,10 +176,13 @@
       dragStartX = e.clientX; dragStartY = e.clientY;
       startLeft = rect.left; startTop = rect.top;
 
+      // 记录当前打开的菜单，拖动时实时重定位
+      const openMenu = document.getElementById('oj-diff-float-menu') || document.getElementById('oj-diff-universal-menu');
+
       if (!useTop) {
         btn.style.bottom = '';
         btn.style.right = '';
-        btn.style.width = btn.offsetWidth + 'px'; // 固定宽度，防止切换定位后拉伸
+        btn.style.width = btn.offsetWidth + 'px';
         btn.style.top = rect.top + 'px';
         btn.style.left = rect.left + 'px';
         useTop = true;
@@ -193,6 +196,21 @@
         if (Math.abs(dx) > 5 || Math.abs(dy) > 5) dragging = true;
         btn.style.left = Math.max(0, Math.min(startLeft + dx, window.innerWidth - bw)) + 'px';
         btn.style.top  = Math.max(0, Math.min(startTop  + dy, window.innerHeight - bh)) + 'px';
+        // 菜单随着按钮实时重新定位（始终完整显示在视口内）
+        if (openMenu) {
+          const mw = openMenu.offsetWidth || 220;
+          const mh = openMenu.offsetHeight || 200;
+          const br = btn.getBoundingClientRect();
+          let ml = br.right - mw;
+          if (ml < 4) ml = Math.max(4, br.left);
+          if (ml + mw > window.innerWidth - 4) ml = window.innerWidth - mw - 4;
+          let mt;
+          if (br.top > mh + 12) { mt = br.top - 8 - mh; }
+          else { mt = br.bottom + 8; }
+          mt = Math.max(4, Math.min(mt, window.innerHeight - mh - 4));
+          openMenu.style.left = ml + 'px';
+          openMenu.style.top  = mt + 'px';
+        }
       };
       const onUp = () => {
         document.removeEventListener('mousemove', onMove);
